@@ -1,0 +1,4 @@
+# Секреты — никогда не загружать на GitHub!
+service_account.json
+bot_token.txt
+__pycache__/
