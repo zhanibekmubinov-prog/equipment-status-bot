@@ -1,0 +1,1 @@
+# equipment-status-bot
