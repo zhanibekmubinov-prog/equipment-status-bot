@@ -81,9 +81,20 @@ BOT_COMMANDS = [
     BotCommand("chatid", "Показать ID этого чата"),
 ]
 
+# В группах показываем только нужное
+GROUP_COMMANDS = [
+    BotCommand("summary", "📋 Сводка за день"),
+]
+
 
 async def post_init(app: Application):
-    await app.bot.set_my_commands(BOT_COMMANDS)
+    from telegram import BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats
+    # личные чаты — полный список
+    await app.bot.set_my_commands(
+        BOT_COMMANDS, scope=BotCommandScopeAllPrivateChats())
+    # группы — только сводка
+    await app.bot.set_my_commands(
+        GROUP_COMMANDS, scope=BotCommandScopeAllGroupChats())
 
 
 # --- Google Sheets --------------------------------------------------------
