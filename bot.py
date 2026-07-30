@@ -1,0 +1,822 @@
+# -*- coding: utf-8 -*-
+"""Equipment status bot: step-by-step updates + daily summary + russian menu.
+
+v5 (Railway-ready): вся конфигурация через переменные окружения.
+
+Переменные окружения (Railway -> Variables):
+    BOT_TOKEN          - токен бота от BotFather (обязательно)
+    GOOGLE_CREDS_JSON  - содержимое service_account.json целиком (обязательно)
+    SUMMARY_CHAT_ID    - ID группового чата для сводки (например -1001234567890)
+    SUMMARY_TIME       - время сводки, по умолчанию 18:00
+    TIMEZONE           - по умолчанию Asia/Atyrau
+    ALLOWED_USERS      - ID через запятую (пусто = разрешено всем)
+
+Локальный запуск по-прежнему работает от файлов
+service_account.json и bot_token.txt рядом со скриптом.
+"""
+import datetime as dt
+import html
+import json
+import os
+import re
+from collections import Counter
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+import gspread
+from telegram import (BotCommand, InlineKeyboardButton, InlineKeyboardMarkup,
+                      ReplyKeyboardMarkup, Update)
+from telegram.error import BadRequest
+from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
+                          ContextTypes, ConversationHandler, MessageHandler,
+                          filters)
+
+# --- Настройки (env-переменные с запасными значениями) --------------------
+
+SPREADSHEET_ID = "1YoEfMJ1jl9qX9oycjZaI7ns9J2fVZ2f3iQexMz-Nn3A"
+SERVICE_ACCOUNT_FILE = "service_account.json"
+TOKEN_FILE = "bot_token.txt"
+
+ALLOWED_USERS = [int(x) for x in
+                 os.getenv("ALLOWED_USERS", "").replace(" ", "").split(",") if x]
+
+SUMMARY_CHAT_ID = int(os.getenv("SUMMARY_CHAT_ID", "0") or "0")
+SUMMARY_TIME = os.getenv("SUMMARY_TIME", "18:00")
+TIMEZONE = os.getenv("TIMEZONE", "Asia/Atyrau")
+
+STATUS_LIST = ["В работе", "В резерве", "В ремонте", "Ожидание", "Новая"]
+PROJECT_LIST = ["ЭМГ", "CIS", "КРС", "Простой"]
+
+BASE_SHEET = "База"
+LOG_SHEET = "Журнал"
+
+
+def now_local():
+    """Текущее время в часовом поясе TIMEZONE (на хостинге сервер живёт в UTC)."""
+    return datetime.now(ZoneInfo(TIMEZONE))
+
+
+COL = {"Текущая локация": 8, "Проект": 9, "Статус": 10, "Текущее состояние": 11,
+       "Последний ремонт": 12, "Примечание": 14, "Дата обновления": 15,
+       "Кто обновил": 16}
+
+KEY = {"Статус": "status", "Проект": "project", "Текущая локация": "location",
+       "Текущее состояние": "condition", "Последний ремонт": "repair",
+       "Примечание": "note"}
+
+(CATEGORY, UNIT, EDIT_MENU, FIELD_INPUT) = range(4)
+
+# --- Меню ------------------------------------------------------------------
+
+BTN_UPDATE = "📝 Обновить статус"
+BTN_SUMMARY = "📋 Сводка"
+
+MENU_KB = ReplyKeyboardMarkup([[BTN_UPDATE, BTN_SUMMARY]],
+                              resize_keyboard=True, is_persistent=True)
+
+# Любой текст в личном чате (кроме кнопок меню) считаем поисковым запросом.
+SEARCH_FILTER = (filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE
+                 & ~filters.Regex(f"^{BTN_UPDATE}$")
+                 & ~filters.Regex(f"^{BTN_SUMMARY}$"))
+
+BOT_COMMANDS = [
+    BotCommand("start", "📝 Обновить статус техники"),
+    BotCommand("summary", "📋 Сводка за день"),
+    BotCommand("cancel", "❌ Отменить текущий ввод"),
+    BotCommand("id", "Показать мой ID"),
+    BotCommand("chatid", "Показать ID этого чата"),
+]
+
+# В группах показываем только нужное
+GROUP_COMMANDS = [
+    BotCommand("summary", "📋 Сводка за день"),
+]
+
+
+async def post_init(app: Application):
+    from telegram import BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats
+    # личные чаты — полный список
+    await app.bot.set_my_commands(
+        BOT_COMMANDS, scope=BotCommandScopeAllPrivateChats())
+    # группы — только сводка
+    await app.bot.set_my_commands(
+        GROUP_COMMANDS, scope=BotCommandScopeAllGroupChats())
+
+
+# --- Google Sheets --------------------------------------------------------
+
+_gc = None
+
+
+def spreadsheet():
+    global _gc
+    if _gc is None:
+        creds = os.getenv("GOOGLE_CREDS_JSON")
+        if creds:
+            _gc = gspread.service_account_from_dict(json.loads(creds))
+        else:
+            _gc = gspread.service_account(filename=SERVICE_ACCOUNT_FILE)
+    return _gc.open_by_key(SPREADSHEET_ID)
+
+
+def load_units():
+    rows = spreadsheet().worksheet(BASE_SHEET).get_all_values()
+    units = []
+    for i, r in enumerate(rows[1:], start=2):
+        if len(r) >= 14 and r[0].strip():
+            units.append({
+                "row": i, "code": r[0].strip(), "category": r[1].strip(),
+                "brand": r[3].strip(), "gos": r[5].strip(),
+                "location": r[7].strip(), "project": r[8].strip(),
+                "status": r[9].strip(), "condition": r[10].strip(),
+                "repair": r[11].strip(), "note": r[13].strip(),
+            })
+    return units
+
+
+def apply_changes(unit, changes, who):
+    """Обновляет строку «Базы» и добавляет ОДНУ строку-снимок в «Журнал»."""
+    ss = spreadsheet()
+    base = ss.worksheet(BASE_SHEET)
+    log = ss.worksheet(LOG_SHEET)
+    now = now_local().strftime("%d.%m.%Y %H:%M")
+
+    cells = []
+    for field, new in changes.items():
+        cells.append(gspread.Cell(unit["row"], COL[field], new))
+    cells.append(gspread.Cell(unit["row"], COL["Дата обновления"], now.split()[0]))
+    cells.append(gspread.Cell(unit["row"], COL["Кто обновил"], who))
+    base.update_cells(cells, value_input_option="RAW")
+
+    def val(field):
+        return changes.get(field, unit[KEY[field]])
+
+    log.append_row(
+        [now, unit["code"], unit["brand"], val("Статус"), val("Проект"),
+         val("Текущая локация"), val("Текущее состояние"),
+         val("Последний ремонт"), val("Примечание"), who],
+        value_input_option="RAW")
+
+
+# --- Сводка ---------------------------------------------------------------
+
+def unit_sentence(u):
+    def e(s):
+        return html.escape(s)
+
+    text = f"<b>{e(u['brand'][:45])}</b> ({u['code']})"
+
+    cond = u["condition"]
+    if cond and cond.lower() != "без дефектов":
+        text += f" — {e(cond[:80])}."
+    else:
+        text += " — без дефектов."
+
+    if u["location"]:
+        place = f" Находится: {e(u['location'])}"
+        if u["project"]:
+            place += f" ({e(u['project'])})"
+        text += place + "."
+
+    text += f" Статус: {u['status'].lower()}."
+
+    if u["note"]:
+        text += f" {e(u['note'][:100])}."
+
+    return text
+
+
+def build_summary():
+    units = load_units()
+    log = spreadsheet().worksheet(LOG_SHEET).get_all_values()[1:]
+    today = now_local().strftime("%d.%m.%Y")
+
+    by_code = {u["code"]: u for u in units}
+    st = Counter(u["status"] for u in units)
+    idle = sum(1 for u in units if u["project"] == "Простой")
+
+    lines = [f"📋 <b>Сводка по технике за {today}</b>", "",
+             f"🟢 В работе: {st.get('В работе', 0)}   "
+             f"🟡 В резерве: {st.get('В резерве', 0)}   "
+             f"🔴 В ремонте: {st.get('В ремонте', 0)}   "
+             f"⏸ Простой: {idle}"]
+
+    changed_codes = []
+    for r in log:
+        if len(r) >= 2 and r[0].startswith(today) and r[1].strip():
+            if r[1].strip() not in changed_codes:
+                changed_codes.append(r[1].strip())
+
+    if changed_codes:
+        by_cat = {}
+        for code in changed_codes:
+            u = by_code.get(code)
+            if u:
+                by_cat.setdefault(u["category"], []).append(u)
+        lines.append("\n<b>Изменения за день:</b>")
+        for cat, items in by_cat.items():
+            lines.append(f"\n<u>{html.escape(cat)}</u>")
+            for u in items:
+                lines.append("▸ " + unit_sentence(u))
+    else:
+        lines.append("\nЗа сегодня изменений не было.")
+
+    attention = [u for u in units if u["status"] in ("В ремонте", "Ожидание")]
+    if attention:
+        lines.append("\n⚠️ <b>Требуют внимания:</b>")
+        for u in attention:
+            lines.append("▸ " + unit_sentence(u))
+
+    return "\n".join(lines)
+
+
+# Telegram hard limit is 4096 characters per message. We keep a margin so
+# that re-opened tags and the "1/3" page marker always fit.
+TG_MSG_LIMIT = 4096
+CHUNK_LIMIT = 3800
+PAGE_MARK_ROOM = 32     # room reserved for the "\n\n<i>1/3</i>" footer
+
+_TAG_RE = re.compile(r"<(/?)(\w+)([^>]*)>")
+
+
+def split_html(text, limit=CHUNK_LIMIT):
+    """Split HTML text into chunks that Telegram will accept.
+
+    Guarantees for every returned chunk:
+      * len(chunk) <= limit  (well under Telegram's 4096 limit);
+      * every tag opened in the chunk is also closed in it — if a cut
+        happens inside <b>...</b>, the tag is closed before the cut and
+        re-opened at the start of the next chunk;
+      * cuts never land inside a tag (<b) or an HTML entity (&amp;);
+      * cuts prefer a line break, then a space, so words stay intact.
+
+    Concatenating the chunks (minus the injected closing/opening tags)
+    reproduces the original text.
+    """
+    chunks = []
+    open_tags = []          # stack of full opening tags, e.g. ['<b>', '<u>']
+    buf = ""
+
+    def closing_for(stack):
+        return "".join("</%s>" % _TAG_RE.match(t).group(2)
+                       for t in reversed(stack))
+
+    def flush():
+        """Close the current chunk and start a new one with the same tags."""
+        nonlocal buf
+        if _TAG_RE.sub("", buf).strip():
+            chunks.append(buf + closing_for(open_tags))
+            buf = "".join(open_tags)
+        else:
+            # Nothing printable yet: Telegram rejects blank messages, so
+            # carry the whitespace over instead of emitting an empty chunk.
+            carried = _TAG_RE.sub("", buf)
+            if len(carried) > limit // 2:
+                # Pathological padding: collapse it, but keep one separator
+                # so that words on either side never get glued together.
+                carried = "\n" if "\n" in carried else " "
+            buf = "".join(open_tags) + carried
+
+    def find_cut(s, room):
+        """Best cut position in plain text s, at most `room` chars."""
+        window = s[:room]
+        for sep in ("\n", " "):
+            pos = window.rfind(sep)
+            if pos > 0:
+                return pos + 1
+        # No separator: cut hard, but not inside an HTML entity.
+        amp = window.rfind("&")
+        if amp > 0 and ";" not in window[amp:]:
+            return amp
+        return room
+
+    pos = 0
+    for m in _TAG_RE.finditer(text):
+        # --- plain text before this tag -------------------------------
+        chunk_text = text[pos:m.start()]
+        while chunk_text:
+            room = limit - len(buf) - len(closing_for(open_tags))
+            if room <= 0:
+                flush()
+                continue
+            if len(chunk_text) <= room:
+                buf += chunk_text
+                break
+            cut = find_cut(chunk_text, room)
+            buf += chunk_text[:cut]
+            chunk_text = chunk_text[cut:]
+            flush()
+
+        # --- the tag itself: never split, keep the pair together ------
+        tag = m.group(0)
+        is_close = bool(m.group(1))
+        self_closing = m.group(3).rstrip().endswith("/")
+        if is_close:
+            # Closing a tag shrinks the reserved space, so it always fits.
+            buf += tag
+            if open_tags:
+                open_tags.pop()
+        else:
+            # An opening tag also reserves room for its own closing tag.
+            extra = 0 if self_closing else len("</%s>" % m.group(2))
+            if len(buf) + len(tag) + len(closing_for(open_tags)) + extra > limit:
+                flush()
+            buf += tag
+            if not self_closing:
+                open_tags.append(tag)
+        pos = m.end()
+
+    # --- trailing text -------------------------------------------------
+    tail = text[pos:]
+    while tail:
+        room = limit - len(buf) - len(closing_for(open_tags))
+        if room <= 0:
+            flush()
+            continue
+        if len(tail) <= room:
+            buf += tail
+            break
+        cut = find_cut(tail, room)
+        buf += tail[:cut]
+        tail = tail[cut:]
+        flush()
+
+    if _TAG_RE.sub("", buf).strip():
+        chunks.append(buf + closing_for(open_tags))
+    return chunks
+
+
+async def send_summary_to(bot, chat_id):
+    """Send the daily summary, split across numbered messages if needed."""
+    text = build_summary()
+    chunks = split_html(text, CHUNK_LIMIT - PAGE_MARK_ROOM)
+    total = len(chunks)
+
+    for num, chunk in enumerate(chunks, 1):
+        # A single message needs no page marker.
+        if total > 1:
+            chunk = f"{chunk}\n\n<i>{num}/{total}</i>"
+        try:
+            await bot.send_message(chat_id, chunk, parse_mode="HTML")
+        except BadRequest as err:
+            # Last-resort fallback: if Telegram still rejects the markup,
+            # send the text without formatting so the summary is not lost.
+            if "parse entities" not in str(err).lower():
+                raise
+            plain = html.unescape(_TAG_RE.sub("", chunk))
+            await bot.send_message(chat_id, plain[:TG_MSG_LIMIT])
+
+
+async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if ALLOWED_USERS and user.id not in ALLOWED_USERS:
+        return
+    try:
+        await send_summary_to(context.bot, update.effective_chat.id)
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка сводки: {e}")
+
+
+async def daily_summary_job(context: ContextTypes.DEFAULT_TYPE):
+    if SUMMARY_CHAT_ID:
+        try:
+            await send_summary_to(context.bot, SUMMARY_CHAT_ID)
+        except Exception as e:
+            print(f"Ошибка отправки сводки: {e}")
+
+
+async def chat_id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"ID этого чата: {update.effective_chat.id}")
+
+
+# --- Вспомогательные ------------------------------------------------------
+
+def kb(buttons, cols=2):
+    rows = [buttons[i:i + cols] for i in range(0, len(buttons), cols)]
+    return InlineKeyboardMarkup(rows)
+
+
+def btn(text, data):
+    return InlineKeyboardButton(text, callback_data=data)
+
+
+def cancel_row():
+    return btn("❌ Отмена", "cancel")
+
+
+def unit_card(u):
+    def esc(s):
+        return html.escape(s) if s else "—"
+    return (f"<b>{esc(u['code'])} — {esc(u['brand'])}</b>\n"
+            f"Категория: {esc(u['category'])}\n"
+            f"Гос. номер: {esc(u['gos'])}\n"
+            f"Текущая локация: {esc(u['location'])}\n"
+            f"Проект: {esc(u['project'])}\n"
+            f"Статус: {esc(u['status'])}\n"
+            f"Состояние: {esc(u['condition'])}\n"
+            f"Последний ремонт: {esc(u['repair'])}\n"
+            f"Примечание: {esc(u['note'])}")
+
+
+def who_is(update):
+    u = update.effective_user
+    name = u.full_name or ""
+    if u.username:
+        name += f" (@{u.username})"
+    return name.strip() or str(u.id)
+
+
+async def send(update, text, markup=None):
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(
+            text, reply_markup=markup, parse_mode="HTML")
+    else:
+        await update.message.reply_text(text, reply_markup=markup, parse_mode="HTML")
+
+
+# --- Диалог обновления ----------------------------------------------------
+
+# Поля, которые можно менять: (название в таблице, подпись на кнопке).
+FIELDS = [
+    ("Статус", "🔴 Статус"),
+    ("Проект", "🏗 Проект"),
+    ("Текущая локация", "📍 Локация"),
+    ("Текущее состояние", "🔧 Состояние"),
+    ("Последний ремонт", "🛠 Ремонт"),
+    ("Примечание", "📝 Примечание"),
+]
+
+# Поля, которые логично очищать одной кнопкой.
+CLEARABLE = {"Примечание", "Текущее состояние"}
+
+MAX_SEARCH_RESULTS = 30
+
+
+def field_options(field):
+    """Готовые значения для поля: нажатие кнопки = сразу выбор."""
+    if field == "Статус":
+        return STATUS_LIST
+    if field == "Проект":
+        return PROJECT_LIST
+    if field == "Текущее состояние":
+        return ["Без дефектов"]
+    if field == "Последний ремонт":
+        return [now_local().strftime("%d.%m.%Y")]
+    return []
+
+
+def edit_card(unit, changes):
+    """Карточка техники: изменённые поля показаны как «старое → новое»."""
+    def esc(s):
+        return html.escape(s) if s else "—"
+
+    lines = [f"<b>{esc(unit['code'])} — {esc(unit['brand'])}</b>",
+             f"{esc(unit['category'])} · гос. номер {esc(unit['gos'])}", ""]
+    for field, _ in FIELDS:
+        old = unit[KEY[field]]
+        if field in changes:
+            lines.append(f"▸ <b>{field}</b>: <s>{esc(old)}</s> → "
+                         f"<b>{esc(changes[field])}</b>")
+        else:
+            lines.append(f"{field}: {esc(old)}")
+    lines.append("")
+    if changes:
+        lines.append(f"Правок: {len(changes)}. Можно изменить ещё поле "
+                     f"или нажать «✅ Записать».")
+    else:
+        lines.append("Нажмите поле, которое изменилось — "
+                     "остальные останутся как есть.")
+    return "\n".join(lines)
+
+
+def edit_menu_kb(changes):
+    buttons = [btn(f"{label}{' ✏️' if field in changes else ''}", f"f:{i}")
+               for i, (field, label) in enumerate(FIELDS)]
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    if changes:
+        rows.append([btn(f"✅ Записать ({len(changes)})", "save"),
+                     btn("↩️ Сбросить", "reset")])
+    rows.append([btn("⬅️ К списку", "back"), cancel_row()])
+    return InlineKeyboardMarkup(rows)
+
+
+async def show_edit_menu(update, context):
+    unit = context.user_data["unit"]
+    changes = context.user_data["changes"]
+    await send(update, edit_card(unit, changes), edit_menu_kb(changes))
+    return EDIT_MENU
+
+
+# --- Поиск техники --------------------------------------------------------
+
+def search_units(units, query):
+    """Поиск по коду, марке и гос. номеру. None = слишком короткий запрос."""
+    q = " ".join(query.lower().split())
+    if len(q) < 2:
+        return None
+    return [u for u in units
+            if q in u["code"].lower()
+            or q in u["brand"].lower()
+            or q in u["gos"].lower()]
+
+
+async def show_search_results(update, context, query):
+    units = context.user_data.get("units") or []
+    hits = search_units(units, query)
+
+    if hits is None:
+        await send(update, "Введите минимум 2 символа — код, марку "
+                           "или гос. номер.")
+        return UNIT
+
+    if not hits:
+        await send(update, f"По запросу «{html.escape(query)}» ничего не найдено.\n"
+                           "Попробуйте код (EX-014), марку (komatsu) "
+                           "или гос. номер.",
+                   kb([btn("⬅️ К категориям", "back"), cancel_row()], 2))
+        return UNIT
+
+    if len(hits) == 1:
+        return await open_unit(update, context, hits[0])
+
+    if len(hits) > MAX_SEARCH_RESULTS:
+        await send(update, f"Найдено {len(hits)} — слишком много. "
+                           "Уточните запрос.",
+                   kb([btn("⬅️ К категориям", "back"), cancel_row()], 2))
+        return UNIT
+
+    buttons = [btn(f"{u['code']} · {u['brand'][:28]}", f"unit:{u['code']}")
+               for u in hits]
+    buttons += [btn("⬅️ К категориям", "back"), cancel_row()]
+    await send(update, f"Найдено {len(hits)} — выберите технику:",
+               kb(buttons, 1))
+    return UNIT
+
+
+async def search_in_dialog(update, context):
+    """Поиск текстом внутри диалога (на экране категорий или списка)."""
+    return await show_search_results(update, context, update.message.text)
+
+
+async def search_entry(update, context):
+    """Поиск текстом без входа в меню: пользователь просто пишет код."""
+    user = update.effective_user
+    if ALLOWED_USERS and user.id not in ALLOWED_USERS:
+        await update.message.reply_text(
+            f"Доступ закрыт. Ваш ID: {user.id} — передайте администратору.")
+        return ConversationHandler.END
+
+    try:
+        units = load_units()
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка чтения таблицы: {e}")
+        return ConversationHandler.END
+
+    context.user_data.clear()
+    context.user_data["units"] = units
+    context.user_data["cats"] = list(dict.fromkeys(u["category"] for u in units))
+    return await show_search_results(update, context, update.message.text)
+
+
+# --- Выбор техники --------------------------------------------------------
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if ALLOWED_USERS and user.id not in ALLOWED_USERS:
+        await update.message.reply_text(
+            f"Доступ закрыт. Ваш ID: {user.id} — передайте администратору.")
+        return ConversationHandler.END
+
+    if (update.message and update.effective_chat.type == "private"
+            and not context.chat_data.get("menu_shown")):
+        await update.message.reply_text(
+            "Кнопки меню включены — они внизу экрана. 👇", reply_markup=MENU_KB)
+        context.chat_data["menu_shown"] = True
+
+    context.user_data.clear()
+    try:
+        units = load_units()
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка чтения таблицы: {e}")
+        return ConversationHandler.END
+
+    context.user_data["units"] = units
+    cats = list(dict.fromkeys(u["category"] for u in units))
+    context.user_data["cats"] = cats
+
+    buttons = [btn(c, f"cat:{i}") for i, c in enumerate(cats)] + [cancel_row()]
+    await send(update, "Выберите категорию — или просто напишите код, марку "
+                       "либо гос. номер техники (например <code>EX-014</code> "
+                       "или <code>komatsu</code>):", kb(buttons, 2))
+    return CATEGORY
+
+
+async def pick_category(update, context):
+    idx = int(update.callback_query.data.split(":")[1])
+    cat = context.user_data["cats"][idx]
+    units = [u for u in context.user_data["units"] if u["category"] == cat]
+    buttons = [btn(f"{u['code']} · {u['brand'][:28]}", f"unit:{u['code']}")
+               for u in units]
+    buttons += [btn("⬅️ Назад", "back"), cancel_row()]
+    await send(update, f"<b>{html.escape(cat)}</b> — выберите технику "
+                       "(или напишите код/марку для поиска):", kb(buttons, 1))
+    return UNIT
+
+
+async def back_to_categories(update, context):
+    cats = context.user_data["cats"]
+    buttons = [btn(c, f"cat:{i}") for i, c in enumerate(cats)] + [cancel_row()]
+    await send(update, "Выберите категорию — или напишите код/марку техники:",
+               kb(buttons, 2))
+    return CATEGORY
+
+
+async def open_unit(update, context, unit):
+    context.user_data["unit"] = unit
+    context.user_data["changes"] = {}
+    return await show_edit_menu(update, context)
+
+
+async def pick_unit(update, context):
+    code = update.callback_query.data.split(":")[1]
+    unit = next(u for u in context.user_data["units"] if u["code"] == code)
+    return await open_unit(update, context, unit)
+
+
+# --- Изменение одного поля ------------------------------------------------
+
+async def pick_field(update, context):
+    idx = int(update.callback_query.data.split(":")[1])
+    field = FIELDS[idx][0]
+    context.user_data["field"] = field
+
+    unit = context.user_data["unit"]
+    current = context.user_data["changes"].get(field, unit[KEY[field]])
+    options = field_options(field)
+
+    opts = [btn(v, f"v:{i}") for i, v in enumerate(options)]
+    extra = []
+    if field in CLEARABLE:
+        extra.append(btn("🧹 Очистить", "clear"))
+    extra += [btn("⬅️ Назад", "back"), cancel_row()]
+
+    hint = ("Выберите значение или напишите текстом:" if options
+            else "Напишите новое значение текстом:")
+    await send(update,
+               f"<b>{field}</b>\nСейчас: {html.escape(current) if current else '—'}\n\n{hint}",
+               kb(opts + extra, 2))
+    return FIELD_INPUT
+
+
+async def store_value(update, context, value):
+    """Запоминает правку (и не считает правкой то, что не изменилось)."""
+    field = context.user_data["field"]
+    unit = context.user_data["unit"]
+    value = value.strip()
+    if value == (unit[KEY[field]] or "").strip():
+        context.user_data["changes"].pop(field, None)
+    else:
+        context.user_data["changes"][field] = value
+    return await show_edit_menu(update, context)
+
+
+async def set_option(update, context):
+    idx = int(update.callback_query.data.split(":")[1])
+    field = context.user_data["field"]
+    return await store_value(update, context, field_options(field)[idx])
+
+
+async def set_text_value(update, context):
+    return await store_value(update, context, update.message.text)
+
+
+async def clear_field(update, context):
+    return await store_value(update, context, "")
+
+
+async def field_back(update, context):
+    return await show_edit_menu(update, context)
+
+
+async def reset_changes(update, context):
+    context.user_data["changes"] = {}
+    return await show_edit_menu(update, context)
+
+
+# --- Запись ---------------------------------------------------------------
+
+async def save_changes(update, context):
+    unit = context.user_data["unit"]
+    changes = context.user_data["changes"]
+    if not changes:
+        await update.callback_query.answer("Изменений нет", show_alert=True)
+        return EDIT_MENU
+
+    try:
+        apply_changes(unit, changes, who_is(update))
+    except Exception as e:
+        await send(update, f"⚠️ Ошибка записи в таблицу: {e}\n"
+                           "Изменения НЕ сохранены. Попробуйте ещё раз.")
+        return ConversationHandler.END
+
+    lines = [f"✅ Записано: <b>{html.escape(unit['code'])} — "
+             f"{html.escape(unit['brand'])}</b>", ""]
+    for field, val in changes.items():
+        lines.append(f"▸ {field}: <b>{html.escape(val) if val else '—'}</b>")
+    lines.append("\nЧтобы обновить ещё технику — напишите её код "
+                 "или нажмите «📝 Обновить статус».")
+    await send(update, "\n".join(lines))
+    return ConversationHandler.END
+
+
+async def cancel(update, context):
+    await send(update, "Отменено. Нажмите «📝 Обновить статус» или напишите "
+                       "код техники, чтобы начать заново.")
+    return ConversationHandler.END
+
+
+async def my_id(update, context):
+    await update.message.reply_text(f"Ваш Telegram ID: {update.effective_user.id}")
+
+
+async def unknown_text(update, context):
+    if update.effective_chat.type == "private":
+        await update.message.reply_text(
+            "Я жду нажатия кнопки. Если запутались — /cancel, затем "
+            "«📝 Обновить статус».")
+
+
+# --- Запуск ---------------------------------------------------------------
+
+def get_token():
+    t = os.getenv("BOT_TOKEN")
+    if t:
+        return t.strip()
+    if os.path.exists(TOKEN_FILE):
+        with open(TOKEN_FILE, encoding="utf-8") as f:
+            return f.read().strip()
+    raise SystemExit("Токен не найден: задайте переменную BOT_TOKEN "
+                     "или создайте bot_token.txt")
+
+
+def main():
+    app = (Application.builder().token(get_token())
+           .connect_timeout(30).read_timeout(30)
+           .get_updates_connect_timeout(30).get_updates_read_timeout(60)
+           .post_init(post_init)
+           .build())
+
+    conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("start", start),
+            MessageHandler(filters.Regex(f"^{BTN_UPDATE}$"), start),
+            # Написал код техники — сразу попал в её карточку.
+            MessageHandler(SEARCH_FILTER, search_entry),
+        ],
+        states={
+            CATEGORY: [CallbackQueryHandler(pick_category, pattern=r"^cat:"),
+                       MessageHandler(SEARCH_FILTER, search_in_dialog)],
+            UNIT: [CallbackQueryHandler(pick_unit, pattern=r"^unit:"),
+                   CallbackQueryHandler(back_to_categories, pattern=r"^back$"),
+                   MessageHandler(SEARCH_FILTER, search_in_dialog)],
+            EDIT_MENU: [CallbackQueryHandler(pick_field, pattern=r"^f:\d+$"),
+                        CallbackQueryHandler(save_changes, pattern=r"^save$"),
+                        CallbackQueryHandler(reset_changes, pattern=r"^reset$"),
+                        CallbackQueryHandler(back_to_categories, pattern=r"^back$")],
+            FIELD_INPUT: [CallbackQueryHandler(set_option, pattern=r"^v:\d+$"),
+                          CallbackQueryHandler(clear_field, pattern=r"^clear$"),
+                          CallbackQueryHandler(field_back, pattern=r"^back$"),
+                          MessageHandler(filters.TEXT & ~filters.COMMAND,
+                                         set_text_value)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel),
+                   CallbackQueryHandler(cancel, pattern=r"^cancel$"),
+                   CommandHandler("start", start)],
+        allow_reentry=True,
+    )
+
+    app.add_handler(conv)
+    app.add_handler(CommandHandler("id", my_id))
+    app.add_handler(CommandHandler("chatid", chat_id_command))
+    app.add_handler(CommandHandler("summary", summary_command))
+    app.add_handler(MessageHandler(filters.Regex(f"^{BTN_SUMMARY}$"),
+                                   summary_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unknown_text))
+
+    if app.job_queue and SUMMARY_CHAT_ID:
+        h, m = map(int, SUMMARY_TIME.split(":"))
+        app.job_queue.run_daily(
+            daily_summary_job, time=dt.time(h, m, tzinfo=ZoneInfo(TIMEZONE)))
+        print(f"Сводка запланирована ежедневно в {SUMMARY_TIME} ({TIMEZONE})")
+    elif not SUMMARY_CHAT_ID:
+        print("SUMMARY_CHAT_ID не задан — автосводка отключена "
+              "(ручная команда /summary работает)")
+
+    print("Бот запущен.")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
