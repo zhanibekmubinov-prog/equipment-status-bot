@@ -1,29 +1,36 @@
 # -*- coding: utf-8 -*-
 """Equipment status bot: step-by-step updates + daily summary + russian menu.
 
-v5 (Railway-ready): вся конфигурация через переменные окружения.
+v6: бот пишет в платформу CIS (раздел «Техника → Статус техники»), а не в
+Google-таблицу «Статус Техники». Диалог, кнопки и сводка — прежние; сменился
+только источник данных: техника читается и обновление записывается через
+API платформы (/api/v1/equipment-status).
 
 Переменные окружения (Railway -> Variables):
     BOT_TOKEN          - токен бота от BotFather (обязательно)
-    GOOGLE_CREDS_JSON  - содержимое service_account.json целиком (обязательно)
+    PLATFORM_URL       - адрес платформы, например https://cis.example.kz
+                         (обязательно)
+    PLATFORM_KEY       - ключ бота: тот же, что в платформе
+                         «Админ-панель → Интеграции → Ключ Telegram-бота
+                         „Статус техники“» (обязательно)
     SUMMARY_CHAT_ID    - ID группового чата для сводки (например -1001234567890)
     SUMMARY_TIME       - время сводки, по умолчанию 18:00
     TIMEZONE           - по умолчанию Asia/Atyrau
     ALLOWED_USERS      - ID через запятую (пусто = разрешено всем)
 
-Локальный запуск по-прежнему работает от файлов
-service_account.json и bot_token.txt рядом со скриптом.
+GOOGLE_CREDS_JSON больше не нужен — его можно удалить из Variables.
+Локальный запуск: токен можно положить в bot_token.txt рядом со скриптом.
 """
 import datetime as dt
 import html
-import json
 import os
 import re
 from collections import Counter
 from datetime import datetime
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
-import gspread
+import httpx
 from telegram import (BotCommand, InlineKeyboardButton, InlineKeyboardMarkup,
                       ReplyKeyboardMarkup, Update)
 from telegram.error import BadRequest
@@ -33,8 +40,8 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
 
 # --- Настройки (env-переменные с запасными значениями) --------------------
 
-SPREADSHEET_ID = "1YoEfMJ1jl9qX9oycjZaI7ns9J2fVZ2f3iQexMz-Nn3A"
-SERVICE_ACCOUNT_FILE = "service_account.json"
+PLATFORM_URL = os.getenv("PLATFORM_URL", "").strip().rstrip("/")
+PLATFORM_KEY = os.getenv("PLATFORM_KEY", "").strip()
 TOKEN_FILE = "bot_token.txt"
 
 ALLOWED_USERS = [int(x) for x in
@@ -47,22 +54,19 @@ TIMEZONE = os.getenv("TIMEZONE", "Asia/Atyrau")
 STATUS_LIST = ["В работе", "В резерве", "В ремонте", "Ожидание", "Новая"]
 PROJECT_LIST = ["ЭМГ", "CIS", "КРС", "Простой"]
 
-BASE_SHEET = "База"
-LOG_SHEET = "Журнал"
-
-
 def now_local():
     """Текущее время в часовом поясе TIMEZONE (на хостинге сервер живёт в UTC)."""
     return datetime.now(ZoneInfo(TIMEZONE))
 
 
-COL = {"Текущая локация": 8, "Проект": 9, "Статус": 10, "Текущее состояние": 11,
-       "Последний ремонт": 12, "Примечание": 14, "Дата обновления": 15,
-       "Кто обновил": 16}
-
 KEY = {"Статус": "status", "Проект": "project", "Текущая локация": "location",
        "Текущее состояние": "condition", "Последний ремонт": "repair",
        "Примечание": "note"}
+
+# Поле в диалоге → поле в API платформы.
+API_FIELD = {"Статус": "status", "Проект": "project",
+             "Текущая локация": "location", "Текущее состояние": "condition",
+             "Последний ремонт": "last_repair", "Примечание": "notes"}
 
 (CATEGORY, UNIT, EDIT_MENU, FIELD_INPUT) = range(4)
 
@@ -76,7 +80,7 @@ MENU_KB = ReplyKeyboardMarkup([[BTN_UPDATE, BTN_SUMMARY]],
 
 # Кнопки нижнего меню — это обычный текст, поэтому их нужно исключать
 # из всех остальных текстовых обработчиков, иначе «📋 Сводка», нажатая
-# внутри диалога, запишется в таблицу как значение поля.
+# внутри диалога, запишется в платформу как значение поля.
 NOT_MENU_BTN = (~filters.Regex(f"^{re.escape(BTN_UPDATE)}$")
                 & ~filters.Regex(f"^{re.escape(BTN_SUMMARY)}$"))
 
@@ -112,59 +116,53 @@ async def post_init(app: Application):
         GROUP_COMMANDS, scope=BotCommandScopeAllGroupChats())
 
 
-# --- Google Sheets --------------------------------------------------------
+# --- Платформа CIS ---------------------------------------------------------
 
-_gc = None
+class PlatformError(Exception):
+    """Платформа отказала: текст ошибки показываем человеку как есть."""
 
 
-def spreadsheet():
-    global _gc
-    if _gc is None:
-        creds = os.getenv("GOOGLE_CREDS_JSON")
-        if creds:
-            _gc = gspread.service_account_from_dict(json.loads(creds))
-        else:
-            _gc = gspread.service_account(filename=SERVICE_ACCOUNT_FILE)
-    return _gc.open_by_key(SPREADSHEET_ID)
+_http = None
+
+
+def platform(method, path="", **kw):
+    """Запрос к API статуса техники. Ответ — словарь из JSON платформы."""
+    global _http
+    if not PLATFORM_URL or not PLATFORM_KEY:
+        raise PlatformError("не заданы PLATFORM_URL и PLATFORM_KEY")
+    if _http is None:
+        _http = httpx.Client(
+            base_url=PLATFORM_URL, timeout=30,
+            headers={"Authorization": f"Bearer {PLATFORM_KEY}"})
+    r = _http.request(method, "/api/v1/equipment-status" + path, **kw)
+    try:
+        data = r.json()
+    except ValueError:
+        raise PlatformError(f"платформа ответила {r.status_code}")
+    if r.status_code != 200 or not data.get("ok"):
+        raise PlatformError(data.get("error")
+                            or f"платформа ответила {r.status_code}")
+    return data
+
+
+def load_status():
+    """Вся техника + коды, обновлённые сегодня (для сводки)."""
+    return platform("GET")
 
 
 def load_units():
-    rows = spreadsheet().worksheet(BASE_SHEET).get_all_values()
-    units = []
-    for i, r in enumerate(rows[1:], start=2):
-        if len(r) >= 14 and r[0].strip():
-            units.append({
-                "row": i, "code": r[0].strip(), "category": r[1].strip(),
-                "brand": r[3].strip(), "gos": r[5].strip(),
-                "location": r[7].strip(), "project": r[8].strip(),
-                "status": r[9].strip(), "condition": r[10].strip(),
-                "repair": r[11].strip(), "note": r[13].strip(),
-            })
-    return units
+    """Техника с теми же ключами, что раньше брались из листа «База»:
+    code, category, brand, gos, location, project, status, condition,
+    repair, note."""
+    return load_status()["units"]
 
 
-def apply_changes(unit, changes, who):
-    """Обновляет строку «Базы» и добавляет ОДНУ строку-снимок в «Журнал»."""
-    ss = spreadsheet()
-    base = ss.worksheet(BASE_SHEET)
-    log = ss.worksheet(LOG_SHEET)
-    now = now_local().strftime("%d.%m.%Y %H:%M")
-
-    cells = []
-    for field, new in changes.items():
-        cells.append(gspread.Cell(unit["row"], COL[field], new))
-    cells.append(gspread.Cell(unit["row"], COL["Дата обновления"], now.split()[0]))
-    cells.append(gspread.Cell(unit["row"], COL["Кто обновил"], who))
-    base.update_cells(cells, value_input_option="RAW")
-
-    def val(field):
-        return changes.get(field, unit[KEY[field]])
-
-    log.append_row(
-        [now, unit["code"], unit["brand"], val("Статус"), val("Проект"),
-         val("Текущая локация"), val("Текущее состояние"),
-         val("Последний ремонт"), val("Примечание"), who],
-        value_input_option="RAW")
+def apply_changes(unit, changes, who, tg_id):
+    """Записывает в платформу только изменённые поля. Платформа кладёт их на
+    ТЕКУЩИЕ значения машины и сама добавляет строку журнала, дату и автора."""
+    platform("POST", "/" + quote(unit["code"], safe=""),
+             json={"changes": {API_FIELD[f]: v for f, v in changes.items()},
+                   "tg_id": tg_id, "author": who})
 
 
 # --- Сводка ---------------------------------------------------------------
@@ -196,8 +194,8 @@ def unit_sentence(u):
 
 
 def build_summary():
-    units = load_units()
-    log = spreadsheet().worksheet(LOG_SHEET).get_all_values()[1:]
+    data = load_status()
+    units = data["units"]
     today = now_local().strftime("%d.%m.%Y")
 
     by_code = {u["code"]: u for u in units}
@@ -210,11 +208,8 @@ def build_summary():
              f"🔴 В ремонте: {st.get('В ремонте', 0)}   "
              f"⏸ Простой: {idle}"]
 
-    changed_codes = []
-    for r in log:
-        if len(r) >= 2 and r[0].startswith(today) and r[1].strip():
-            if r[1].strip() not in changed_codes:
-                changed_codes.append(r[1].strip())
+    # коды техники, обновлённой за сегодня, — считает платформа по журналу
+    changed_codes = data["today"]
 
     if changed_codes:
         by_cat = {}
@@ -459,7 +454,7 @@ async def send(update, text, markup=None):
 
 # --- Диалог обновления ----------------------------------------------------
 
-# Поля, которые можно менять: (название в таблице, подпись на кнопке).
+# Поля, которые можно менять: (название поля, подпись на кнопке).
 FIELDS = [
     ("Статус", "🔴 Статус"),
     ("Проект", "🏗 Проект"),
@@ -521,8 +516,8 @@ def edit_card(unit, changes):
 def save_button(changes):
     """Широкая кнопка записи — всегда одна в своём ряду, в самом низу."""
     if changes:
-        return btn(f"✅ ЗАПИСАТЬ В ТАБЛИЦУ ({len(changes)}) ✅", "save")
-    return btn("✅ ЗАПИСАТЬ В ТАБЛИЦУ", "save")
+        return btn(f"✅ ЗАПИСАТЬ ({len(changes)}) ✅", "save")
+    return btn("✅ ЗАПИСАТЬ", "save")
 
 
 def edit_menu_kb(changes):
@@ -609,7 +604,7 @@ async def search_entry(update, context):
     try:
         units = load_units()
     except Exception as e:
-        await update.message.reply_text(f"Ошибка чтения таблицы: {e}")
+        await update.message.reply_text(f"Ошибка связи с платформой: {e}")
         return ConversationHandler.END
 
     context.user_data.clear()
@@ -637,7 +632,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         units = load_units()
     except Exception as e:
-        await update.message.reply_text(f"Ошибка чтения таблицы: {e}")
+        await update.message.reply_text(f"Ошибка связи с платформой: {e}")
         return ConversationHandler.END
 
     context.user_data["units"] = units
@@ -812,9 +807,9 @@ async def save_changes(update, context):
         return EDIT_MENU
 
     try:
-        apply_changes(unit, changes, who_is(update))
+        apply_changes(unit, changes, who_is(update), update.effective_user.id)
     except Exception as e:
-        await send(update, f"⚠️ Ошибка записи в таблицу: {e}\n"
+        await send(update, f"⚠️ Ошибка записи в платформу: {e}\n"
                            "Изменения НЕ сохранены. Попробуйте ещё раз.")
         return ConversationHandler.END
 
@@ -931,7 +926,10 @@ def main():
         print("SUMMARY_CHAT_ID не задан — автосводка отключена "
               "(ручная команда /summary работает)")
 
-    print("Бот запущен.")
+    if not PLATFORM_URL or not PLATFORM_KEY:
+        raise SystemExit("Задайте переменные PLATFORM_URL и PLATFORM_KEY "
+                         "(ключ — в платформе: Админ-панель → Интеграции)")
+    print(f"Бот запущен. Платформа: {PLATFORM_URL}")
     app.run_polling()
 
 
