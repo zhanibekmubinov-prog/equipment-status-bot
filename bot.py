@@ -6,6 +6,12 @@ Google-таблицу «Статус Техники». Диалог, кнопк�
 только источник данных: техника читается и обновление записывается через
 API платформы (/api/v1/equipment-status).
 
+v7: запись ТО / ремонта в реестр ТО платформы (кнопка «🔧 ТО / ремонт» в
+меню и в карточке машины, команда /to). Короткий набор полей бланка F-002:
+вид и номер ТО, дата, что сделано, показание счётчика, закрытие дефектного
+акта. Полный бланк, правка и удаление записи — в платформе. API —
+/api/v1/equipment-service, тот же ключ PLATFORM_KEY.
+
 Переменные окружения (Railway -> Variables):
     BOT_TOKEN          - токен бота от BotFather (обязательно)
     PLATFORM_URL       - адрес платформы, например https://cis.example.kz
@@ -68,21 +74,23 @@ API_FIELD = {"Статус": "status", "Проект": "project",
              "Текущая локация": "location", "Текущее состояние": "condition",
              "Последний ремонт": "last_repair", "Примечание": "notes"}
 
-(CATEGORY, UNIT, EDIT_MENU, FIELD_INPUT) = range(4)
+(CATEGORY, UNIT, EDIT_MENU, FIELD_INPUT, SERVICE) = range(5)
 
 # --- Меню ------------------------------------------------------------------
 
 BTN_UPDATE = "📝 Обновить статус"
 BTN_SUMMARY = "📋 Сводка"
+BTN_SERVICE = "🔧 ТО / ремонт"
 
-MENU_KB = ReplyKeyboardMarkup([[BTN_UPDATE, BTN_SUMMARY]],
+MENU_KB = ReplyKeyboardMarkup([[BTN_UPDATE, BTN_SERVICE], [BTN_SUMMARY]],
                               resize_keyboard=True, is_persistent=True)
 
 # Кнопки нижнего меню — это обычный текст, поэтому их нужно исключать
 # из всех остальных текстовых обработчиков, иначе «📋 Сводка», нажатая
 # внутри диалога, запишется в платформу как значение поля.
 NOT_MENU_BTN = (~filters.Regex(f"^{re.escape(BTN_UPDATE)}$")
-                & ~filters.Regex(f"^{re.escape(BTN_SUMMARY)}$"))
+                & ~filters.Regex(f"^{re.escape(BTN_SUMMARY)}$")
+                & ~filters.Regex(f"^{re.escape(BTN_SERVICE)}$"))
 
 # Любой текст в личном чате (кроме кнопок меню) считаем поисковым запросом.
 SEARCH_FILTER = (filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE
@@ -94,6 +102,7 @@ FIELD_TEXT_FILTER = filters.TEXT & ~filters.COMMAND & NOT_MENU_BTN
 
 BOT_COMMANDS = [
     BotCommand("start", "📝 Обновить статус техники"),
+    BotCommand("to", "🔧 Записать ТО / ремонт"),
     BotCommand("summary", "📋 Сводка за день"),
     BotCommand("cancel", "❌ Отменить текущий ввод"),
     BotCommand("id", "Показать мой ID"),
@@ -125,8 +134,9 @@ class PlatformError(Exception):
 _http = None
 
 
-def platform(method, path="", **kw):
-    """Запрос к API статуса техники. Ответ — словарь из JSON платформы."""
+def platform(method, path="", base="/api/v1/equipment-status", **kw):
+    """Запрос к API платформы (статус техники или реестр ТО). Ответ —
+    словарь из JSON платформы."""
     global _http
     if not PLATFORM_URL or not PLATFORM_KEY:
         raise PlatformError("не заданы PLATFORM_URL и PLATFORM_KEY")
@@ -134,7 +144,7 @@ def platform(method, path="", **kw):
         _http = httpx.Client(
             base_url=PLATFORM_URL, timeout=30,
             headers={"Authorization": f"Bearer {PLATFORM_KEY}"})
-    r = _http.request(method, "/api/v1/equipment-status" + path, **kw)
+    r = _http.request(method, base + path, **kw)
     try:
         data = r.json()
     except ValueError:
@@ -163,6 +173,22 @@ def apply_changes(unit, changes, who, tg_id):
     platform("POST", "/" + quote(unit["code"], safe=""),
              json={"changes": {API_FIELD[f]: v for f, v in changes.items()},
                    "tg_id": tg_id, "author": who})
+
+
+SERVICE_API = "/api/v1/equipment-service"
+
+
+def load_service_form(code):
+    """Что предложить в диалоге ТО: виды ТО по нормативам машины, счётчики
+    с последним показанием, открытые дефектные акты."""
+    return platform("GET", "/" + quote(code, safe=""), base=SERVICE_API)
+
+
+def add_service_record(code, record, who, tg_id):
+    """Записывает ТО / ремонт в реестр ТО платформы. Проверки — те же, что у
+    формы F-002 в платформе: ошибку платформа вернёт текстом."""
+    return platform("POST", "/" + quote(code, safe=""), base=SERVICE_API,
+                    json=dict(record, tg_id=tg_id, author=who))
 
 
 # --- Сводка ---------------------------------------------------------------
@@ -526,6 +552,8 @@ def edit_menu_kb(changes):
     rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
     if changes:
         rows.append([btn("↩️ Сбросить правки", "reset")])
+    else:
+        rows.append([btn("🔧 Записать ТО / ремонт", "s:start")])
     rows.append([btn("⬅️ К списку", "back"), cancel_row()])
     # Последний ряд — только запись: она занимает всю ширину экрана и
     # отделена от служебных кнопок, поэтому её не пропускают.
@@ -616,6 +644,15 @@ async def search_entry(update, context):
 # --- Выбор техники --------------------------------------------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await begin(update, context, "status")
+
+
+async def start_service(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """«🔧 ТО / ремонт»: тот же выбор машины, затем запись ТО."""
+    return await begin(update, context, "service")
+
+
+async def begin(update, context, mode):
     user = update.effective_user
     if ALLOWED_USERS and user.id not in ALLOWED_USERS:
         await update.message.reply_text(
@@ -636,11 +673,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     context.user_data["units"] = units
+    context.user_data["mode"] = mode
     cats = list(dict.fromkeys(u["category"] for u in units))
     context.user_data["cats"] = cats
 
     buttons = [btn(c, f"cat:{i}") for i, c in enumerate(cats)] + [cancel_row()]
-    await send(update, "Выберите категорию — или просто напишите код, марку "
+    title = ("🔧 <b>Запись ТО / ремонта.</b>\n" if mode == "service"
+             else "")
+    await send(update, title + "Выберите категорию — или просто напишите код, марку "
                        "либо гос. номер техники (например <code>EX-014</code> "
                        "или <code>komatsu</code>):", kb(buttons, 2))
     return CATEGORY
@@ -676,6 +716,8 @@ async def open_unit(update, context, unit):
     context.user_data["unit"] = unit
     context.user_data["changes"] = {}
     context.user_data.pop("append", None)
+    if context.user_data.get("mode") == "service":
+        return await service_start(update, context)
     return await show_edit_menu(update, context)
 
 
@@ -840,6 +882,313 @@ async def unknown_text(update, context):
             "«📝 Обновить статус».")
 
 
+# --- Запись ТО / ремонта (v7) ---------------------------------------------
+# Шаги идут по порядку, пока чего-то не хватает: вид → номер ТО → дата →
+# что сделано → показание счётчика → закрытие дефекта (только ремонт) →
+# проверка и запись. Всё, что ввели, — в context.user_data["svc"];
+# «✏️ Заново» очищает ввод и проходит шаги снова.
+
+DESCRIPTION_MAX = 2000
+
+
+def fmt_num(x):
+    return str(int(x)) if float(x).is_integer() else str(round(x, 1))
+
+
+def parse_number(text):
+    """«12 481,5» → 12481.5; не число → None."""
+    t = (text or "").replace(" ", "").replace(" ", "").replace(",", ".")
+    try:
+        return float(t) if t else None
+    except ValueError:
+        return None
+
+
+def parse_day(text, today):
+    """«28.10.2026», «28.10.26», «28.10» → дата; иначе None."""
+    m = re.fullmatch(r"\s*(\d{1,2})[./-](\d{1,2})(?:[./-](\d{2}|\d{4}))?\s*",
+                     text or "")
+    if not m:
+        return None
+    day, month, year = int(m[1]), int(m[2]), m[3]
+    if not year:
+        year = today.year
+    else:
+        year = int(year) + (2000 if len(year) == 2 else 0)
+    try:
+        return dt.date(year, month, day)
+    except ValueError:
+        return None
+
+
+def service_meter(svc):
+    """Счётчик записи: выбранный, основной по нормативу или единственный."""
+    form = svc["form"]
+    if svc.get("meter"):
+        return svc["meter"]
+    if form.get("meter"):
+        return form["meter"]
+    if len(form.get("meters") or []) == 1:
+        return form["meters"][0]["code"]
+    return None
+
+
+def meter_info(form, code):
+    for m in (form.get("meters") or []) + (form.get("meter_choices") or []):
+        if m["code"] == code:
+            return m
+    return {"code": code, "title": code, "unit": "", "value": None}
+
+
+def service_card(unit, svc):
+    """Что уже введено — над каждым шагом и на экране проверки."""
+    def esc(s):
+        return html.escape(str(s)) if s not in (None, "") else "—"
+    form = svc["form"]
+    lines = [f"🔧 <b>{esc(unit['code'])} — {esc(unit['brand'])}</b>"]
+    if svc.get("kind"):
+        what = (svc.get("code") or "ТО") if svc["kind"] == "ТО" else "Ремонт"
+        lines.append(f"Вид: <b>{esc(what)}</b>")
+    if svc.get("date"):
+        lines.append(f"Дата: <b>{svc['date']:%d.%m.%Y}</b>")
+    if svc.get("description"):
+        lines.append(f"Что сделано: {esc(svc['description'])}")
+    if svc.get("reading") is not None:
+        m = meter_info(form, service_meter(svc))
+        lines.append(f"Показание: <b>{fmt_num(svc['reading'])} {esc(m['unit'])}"
+                     f"</b> ({esc(m['title'])})")
+    elif svc.get("reading_skipped"):
+        lines.append("Показание: —")
+    defect = next((d for d in form.get("defects") or []
+                   if d["id"] == svc.get("defect_id")), None)
+    if defect:
+        lines.append(f"Закрывает дефект: <b>{esc(defect['title'])}</b>")
+    return "\n".join(lines)
+
+
+def service_record(svc):
+    """Тело запроса к платформе — поля как у формы F-002."""
+    record = {"kind": svc["kind"], "date": svc["date"].isoformat(),
+              "description": svc["description"]}
+    if svc["kind"] == "ТО":
+        record["norm_code"] = svc.get("code") or "ТО"
+    if svc.get("reading") is not None:
+        record["reading"] = svc["reading"]
+        record["meter"] = service_meter(svc)
+    if svc.get("defect_id"):
+        record["defect_id"] = svc["defect_id"]
+        record["closes_defect"] = True
+    return record
+
+
+def service_rows(*rows):
+    """Кнопки шага + нижний ряд «к карточке / отмена»."""
+    return InlineKeyboardMarkup([list(r) for r in rows if r]
+                                + [[btn("⬅️ К карточке", "s:card"),
+                                    cancel_row()]])
+
+
+async def service_start(update, context):
+    """Начало записи ТО по выбранной машине."""
+    unit = context.user_data.get("unit")
+    if unit is None:
+        return await stale_session(update)
+    try:
+        form = load_service_form(unit["code"])
+    except Exception as e:
+        await send(update, f"Ошибка связи с платформой: {html.escape(str(e))}")
+        return ConversationHandler.END
+    if not form.get("platform"):
+        await send(update, "Реестр ТО ещё ведётся в Google-таблице — записывать "
+                           "ТО из бота можно после его переноса в платформу.")
+        return ConversationHandler.END
+    context.user_data["svc"] = {"form": form}
+    return await service_step(update, context)
+
+
+async def service_step(update, context, note=""):
+    """Показывает первый шаг, которого ещё не хватает."""
+    if not has_state(context, "unit", "svc"):
+        return await stale_session(update)
+    unit, svc = context.user_data["unit"], context.user_data["svc"]
+    form = svc["form"]
+    svc["await"] = None
+    head = (note + "\n\n" if note else "") + service_card(unit, svc) + "\n\n"
+
+    if not svc.get("kind"):
+        await send(update, head + "Что делали?", service_rows(
+            [btn("🛠 ТО", "s:k:to"), btn("🔧 Ремонт", "s:k:r")]))
+        return SERVICE
+
+    codes = form.get("codes") or ["ТО"]
+    if svc["kind"] == "ТО" and not svc.get("code"):
+        if len(codes) == 1:
+            svc["code"] = codes[0]
+        else:
+            buttons = [btn(c, f"s:c:{i}") for i, c in enumerate(codes)]
+            await send(update, head + "Какое ТО? «ТО» без номера — если "
+                                      "номер не важен.",
+                       service_rows(buttons))
+            return SERVICE
+
+    if not svc.get("date"):
+        today = now_local().date()
+        days = [(0, "Сегодня"), (1, "Вчера"), (2, "Позавчера")]
+        buttons = [btn(f"{t} {today - dt.timedelta(days=n):%d.%m}", f"s:d:{n}")
+                   for n, t in days]
+        svc["await"] = "date"
+        await send(update, head + "Когда? Нажмите кнопку или напишите дату "
+                                  "(например <code>25.10</code>).",
+                   service_rows(buttons))
+        return SERVICE
+
+    if not svc.get("description"):
+        svc["await"] = "description"
+        await send(update, head + "Что сделано? Напишите текстом — например "
+                                  "<i>замена масла ДВС, фильтры масляный и "
+                                  "топливный</i>.", service_rows())
+        return SERVICE
+
+    if svc.get("reading") is None and not svc.get("reading_skipped"):
+        meter = service_meter(svc)
+        if meter is None:
+            buttons = [btn(f"{m['title']}, {m['unit']}", f"s:m:{i}")
+                       for i, m in enumerate(form.get("meter_choices") or [])]
+            await send(update, head + "Показание какого счётчика записать?",
+                       service_rows(buttons[:2], buttons[2:],
+                                    [btn("⏭ Без показания", "s:skip")]))
+            return SERVICE
+        m = meter_info(form, meter)
+        last = ""
+        if m.get("value") is not None:
+            last = (f"\nПоследнее: {fmt_num(m['value'])} "
+                    f"{html.escape(m['unit'])} на "
+                    f"{dt.date.fromisoformat(m['date']):%d.%m.%Y}.")
+        svc["await"] = "reading"
+        await send(update, head + f"Показание счётчика "
+                                  f"«{html.escape(m['title'])}», "
+                                  f"{html.escape(m['unit'])}?{last}\n"
+                                  "Напишите число — или нажмите "
+                                  "«Без показания».",
+                   service_rows([btn("⏭ Без показания", "s:skip")]))
+        return SERVICE
+
+    defects = form.get("defects") or []
+    if svc["kind"] == "Р" and defects and "defect_id" not in svc:
+        buttons = [[btn(f"✅ {d['title'][:48]}", f"s:x:{i}")]
+                   for i, d in enumerate(defects)]
+        await send(update, head + "Ремонт устранил дефект по акту? Акт "
+                                  "закроется вместе с записью.",
+                   service_rows(*buttons, [btn("Нет, акт не закрывать",
+                                               "s:x:no")]))
+        return SERVICE
+
+    await send(update, head + "Проверьте и нажмите <b>«✅ ЗАПИСАТЬ»</b>.",
+               InlineKeyboardMarkup([
+                   [btn("✏️ Заново", "s:redo"), cancel_row()],
+                   [btn("✅ ЗАПИСАТЬ В РЕЕСТР ТО ✅", "s:save")]]))
+    return SERVICE
+
+
+async def service_button(update, context):
+    if not has_state(context, "unit", "svc"):
+        return await stale_session(update)
+    svc = context.user_data["svc"]
+    form = svc["form"]
+    parts = update.callback_query.data.split(":")
+    action, arg = parts[1], (parts[2] if len(parts) > 2 else "")
+    try:
+        if action == "k":
+            svc["kind"] = "ТО" if arg == "to" else "Р"
+        elif action == "c":
+            svc["code"] = (form.get("codes") or ["ТО"])[int(arg)]
+        elif action == "d":
+            svc["date"] = now_local().date() - dt.timedelta(days=int(arg))
+        elif action == "m":
+            svc["meter"] = form["meter_choices"][int(arg)]["code"]
+        elif action == "skip":
+            svc["reading"], svc["reading_skipped"] = None, True
+        elif action == "x":
+            svc["defect_id"] = (None if arg == "no"
+                                else form["defects"][int(arg)]["id"])
+        elif action == "redo":
+            context.user_data["svc"] = {"form": form}
+        elif action == "card":
+            context.user_data.pop("svc", None)
+            return await show_edit_menu(update, context)
+        elif action == "save":
+            return await service_save(update, context)
+    except (IndexError, KeyError, ValueError):
+        return await stale_session(update)
+    return await service_step(update, context)
+
+
+async def service_text(update, context):
+    """Текст на шаге ТО: дата, что сделано или показание счётчика."""
+    if not has_state(context, "unit", "svc"):
+        return await stale_session(update)
+    svc = context.user_data["svc"]
+    text = (update.message.text or "").strip()
+    waiting = svc.get("await")
+    if waiting == "date":
+        today = now_local().date()
+        day = parse_day(text, today)
+        if day is None:
+            return await service_step(update, context,
+                                      "⚠️ Не понял дату. Пример: 25.10.2026")
+        if day > today:
+            return await service_step(update, context,
+                                      "⚠️ Дата в будущем — так нельзя.")
+        svc["date"] = day
+    elif waiting == "description":
+        if not text:
+            return await service_step(update, context)
+        svc["description"] = text[:DESCRIPTION_MAX]
+    elif waiting == "reading":
+        value = parse_number(text)
+        if value is None or value < 0:
+            return await service_step(update, context,
+                                      "⚠️ Показание — число, например 12480.")
+        svc["reading"] = value
+    else:
+        await update.message.reply_text(
+            "Нажмите кнопку под сообщением выше — или /cancel.")
+        return SERVICE
+    return await service_step(update, context)
+
+
+async def service_save(update, context):
+    unit, svc = context.user_data["unit"], context.user_data["svc"]
+    try:
+        res = add_service_record(unit["code"], service_record(svc),
+                                 who_is(update), update.effective_user.id)
+    except Exception as e:
+        # платформа объясняет, что не так (показание меньше прошлого и т.п.)
+        await send(update, f"⚠️ Платформа не приняла запись: "
+                           f"{html.escape(str(e))}\n\n"
+                           + service_card(unit, svc),
+                   InlineKeyboardMarkup([
+                       [btn("✏️ Заново", "s:redo"), cancel_row()],
+                       [btn("🔁 Повторить запись", "s:save")]]))
+        return SERVICE
+    lines = [f"✅ Записано в реестр ТО: <b>{html.escape(unit['code'])} — "
+             f"{html.escape(res['record']['label'])}</b>"]
+    if res.get("closed"):
+        lines.append(f"Дефектный акт {html.escape(res['closed'])} закрыт.")
+    state = res.get("to_state")
+    if state and state.get("remaining") is not None:
+        left = f"{fmt_num(abs(state['remaining']))} {state['unit']}"
+        if state["status"] == "due":
+            lines.append(f"⚠️ {state['code']} просрочено на {left}.")
+        else:
+            lines.append(f"До {state['code']}: {left}.")
+    lines.append("\nЕщё запись — «🔧 ТО / ремонт». Исправить запись можно "
+                 "в платформе: Техника → машина → Реестр ТО.")
+    context.user_data.pop("svc", None)
+    await send(update, "\n".join(lines))
+    return ConversationHandler.END
+
+
 # --- Запуск ---------------------------------------------------------------
 
 def get_token():
@@ -869,6 +1218,9 @@ def build_conversation():
         entry_points=[
             CommandHandler("start", start),
             MessageHandler(filters.Regex(f"^{re.escape(BTN_UPDATE)}$"), start),
+            CommandHandler("to", start_service),
+            MessageHandler(filters.Regex(f"^{re.escape(BTN_SERVICE)}$"),
+                           start_service),
             # Написал код техники — сразу попал в её карточку.
             MessageHandler(SEARCH_FILTER, search_entry),
         ],
@@ -882,6 +1234,7 @@ def build_conversation():
                         CallbackQueryHandler(save_changes, pattern=r"^save$"),
                         CallbackQueryHandler(reset_changes, pattern=r"^reset$"),
                         CallbackQueryHandler(back_to_categories, pattern=r"^back$"),
+                        CallbackQueryHandler(service_start, pattern=r"^s:start$"),
                         # Написал код другой техники — переключились на неё.
                         MessageHandler(SEARCH_FILTER, search_in_dialog)],
             FIELD_INPUT: [CallbackQueryHandler(set_option, pattern=r"^v:\d+$"),
@@ -889,6 +1242,9 @@ def build_conversation():
                           CallbackQueryHandler(clear_field, pattern=r"^clear$"),
                           CallbackQueryHandler(field_back, pattern=r"^back$"),
                           MessageHandler(FIELD_TEXT_FILTER, set_text_value)],
+            # Запись ТО: кнопки шагов и текст (дата, что сделано, показание).
+            SERVICE: [CallbackQueryHandler(service_button, pattern=r"^s:"),
+                      MessageHandler(FIELD_TEXT_FILTER, service_text)],
         },
         # fallbacks проверяются ПОСЛЕ обработчиков состояния, поэтому кнопки
         # нижнего меню и команды работают в любой момент, не мешая вводу текста.
@@ -897,6 +1253,9 @@ def build_conversation():
                    CommandHandler("start", start),
                    MessageHandler(filters.Regex(f"^{re.escape(BTN_UPDATE)}$"),
                                   start),
+                   CommandHandler("to", start_service),
+                   MessageHandler(filters.Regex(f"^{re.escape(BTN_SERVICE)}$"),
+                                  start_service),
                    MessageHandler(filters.Regex(f"^{re.escape(BTN_SUMMARY)}$"),
                                   summary_command)],
     )
